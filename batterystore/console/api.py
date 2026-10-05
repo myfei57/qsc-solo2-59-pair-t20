@@ -133,7 +133,26 @@ class Api:
         }
 
     def _operations(self, params: dict, body: dict) -> dict:
-        return {"operations": self._platform.audit.operations(limit=int(params.get("limit", 20)))}
+        def _optional(key: str) -> str | None:
+            value = params.get(key)
+            return str(value) if value not in (None, "") else None
+
+        limit = int(params.get("limit", 20))
+        filters = {
+            "component": _optional("component"),
+            "severity": _optional("severity"),
+            "station": _optional("station"),
+        }
+        # source=rebuild 时从落盘流水重建，用于内存窗口淘汰后核对历史区间；
+        # window 缺省重建全部落盘流水，给定时与当时实时窗口口径一致。
+        if _optional("source") == "rebuild":
+            window = int(params["window"]) if params.get("window") not in (None, "") else None
+            return {
+                "source": "rebuild",
+                "window": window,
+                "operations": self._platform.audit.rebuild_operations(limit, window=window, **filters),
+            }
+        return {"source": "memory", "operations": self._platform.audit.operations(limit, **filters)}
 
     def _events(self, params: dict, body: dict) -> dict:
         topic = params.get("topic")

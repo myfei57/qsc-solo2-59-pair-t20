@@ -3,6 +3,17 @@
 ``AuditLog`` 是事件总线的全量订阅者：组件只发布事件，日志把它们落成流水并
 保留内存副本。控制台读内存副本，跨重启回放读落盘流水；两份数据都来自同一个
 :class:`AuditRecord` 结构，字段口径一致。
+
+内存只留最近一段（``memory_limit`` 条），更早的记录靠分段流水保留。操作区间
+因此有两个读取入口，二者折叠同一段记录时结论必须一致：
+
+* :meth:`operations` 折叠内存窗口（实时巡检看的就是这份）；
+* :meth:`rebuild_operations` 从全部落盘流水重建。重建取“最近 N 条”时，与
+  当时实时窗口对应的就是流水末尾同样的 N 条——归并是与顺序无关的纯折叠，
+  日志滚段不会让跨段的一次操作丢掉中间那部分。
+
+要保证滚段后仍能重建，落盘流水的保留范围必须覆盖要查询的重建窗口；流水只
+追加、不在本模块内删除，跨段操作的每一条都还在原段落盘里。
 """
 
 from __future__ import annotations
@@ -49,14 +60,19 @@ class AuditLog:
         )
 
     def record(self, record: AuditRecord) -> dict:
-        """记一条流水（内存 + 落盘），返回其字典形式。"""
+        """记一条流水（内存 + 落盘），返回其字典形式。
+
+        入库序号直接取落盘前的流水累计条数：序号即该记录在只追加流水中的行号，
+        内存淘汰与跨段滚动都不改号，重建时还原出的序号与实时分配的完全相同。
+        """
 
         with self._lock:
-            self._entries.append(record)
+            numbered = record.with_seq(self._journal.count())
+            self._entries.append(numbered)
             if len(self._entries) > self._memory_limit:
                 del self._entries[: len(self._entries) - self._memory_limit]
-            self._journal.append(record.as_dict())
-        return record.as_dict()
+            self._journal.append(numbered.as_dict())
+        return numbered.as_dict()
 
     def entries(self, limit: int = 100) -> list[dict]:
         """返回最近的记录（最新的在前）。"""
@@ -99,10 +115,51 @@ class AuditLog:
         with self._lock:
             return list(self._entries)[-limit:]
 
-    def operations(self, limit: int = 20) -> list[dict]:
-        """返回按操作标识归并的区间。"""
+    def operations(
+        self,
+        limit: int = 20,
+        *,
+        component: str | None = None,
+        severity: str | None = None,
+        station: str | None = None,
+    ) -> list[dict]:
+        """返回内存窗口内按操作标识归并的区间（实时巡检口径）。"""
 
-        return index_operations(self.records(self._memory_limit), limit)
+        with self._lock:
+            selected = list(self._entries)
+        return index_operations(
+            selected, limit=limit, component=component, severity=severity, station=station
+        )
+
+    def rebuild_operations(
+        self,
+        limit: int = 20,
+        *,
+        window: int | None = None,
+        component: str | None = None,
+        severity: str | None = None,
+        station: str | None = None,
+    ) -> list[dict]:
+        """从落盘流水重建操作区间。
+
+        ``window`` 给定时只折叠最近 ``window`` 条，口径与“当时内存窗口等于
+        window 条”实时看到的一致：二者折叠的是同样那一段记录（流水末尾 window
+        条），归并与到达顺序无关，滚段也不会丢掉跨段操作的中间记录。``window``
+        缺省折叠全部落盘流水。重建前先在锁内取一致的流水条数，避免读到追加到
+        一半的窗口。
+        """
+
+        with self._lock:
+            total = self._journal.count()
+            raw = self._journal.read_all()
+        if len(raw) > total:
+            raw = raw[:total]
+        if window is not None and window >= 0:
+            raw = raw[-max(0, window):]
+        records = [AuditRecord.from_dict(item) for item in raw]
+        return index_operations(
+            records, limit=limit, component=component, severity=severity, station=station
+        )
 
     def summary(self) -> dict:
         """返回审计汇总计数。"""
