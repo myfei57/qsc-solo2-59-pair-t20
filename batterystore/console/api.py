@@ -70,6 +70,7 @@ class Api:
         add("GET", "/api/audit", self._audit)
         add("GET", "/api/audit/report", lambda params, body: self._platform.audit.report())
         add("GET", "/api/audit/operations", self._operations)
+        add("GET", "/api/audit/operations/policies", self._operation_policies)
         add("GET", "/api/alarms", lambda params, body: {"alarms": self._platform.audit.alarms()})
         add("GET", "/api/alerts", lambda params, body: {"alerts": self._platform.alerts()})
         add("GET", "/api/events", self._events)
@@ -133,7 +134,18 @@ class Api:
         }
 
     def _operations(self, params: dict, body: dict) -> dict:
-        return {"operations": self._platform.audit.operations(limit=int(params.get("limit", 20)))}
+        return {
+            "policy": "cycle",
+            "operations": self._platform.audit.operations(
+                limit=int(params.get("limit", 20)),
+                component=params.get("component"),
+                severity=params.get("severity"),
+                rebuilt=params.get("source") == "journal",
+            )
+        }
+
+    def _operation_policies(self, params: dict, body: dict) -> dict:
+        return self._platform.audit.operation_policy_compare(limit=int(params.get("limit", 20)))
 
     def _events(self, params: dict, body: dict) -> dict:
         topic = params.get("topic")
